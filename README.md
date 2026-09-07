@@ -10,6 +10,12 @@
 -->
 # dsh-blue-team
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-blue-team"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 蓝队防御插件——**爱丽丝的防御之手**。以 MITRE ATT&CK 为能力地图，覆盖资产发现→漏洞评估→威胁检测→日志取证→加固基线全链路。
 
 ## 工具面（8 工具）
