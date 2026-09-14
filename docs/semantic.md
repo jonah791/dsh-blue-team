@@ -102,6 +102,56 @@ dsh-blue-team · apply(ctx, config)
 | 落盘产物 | **无**——结果只回模型，不留痕、不落库 | — |
 | 日志 | `ctx.logger('blue-team')`：仅装载时一行（**宿主 logger 不落盘**） | — |
 
+### 4.4 自证轨迹契约（可维护性 S4 · 2026-09-14）
+
+**落盘路径（单一真源）**：`<DSH_HOME>/blue-team-trace.jsonl`，写入者是
+`src/trace.ts:resolveHome()`（`DSH_HOME` → 回退 `homedir()/.dsh`）+ `tracePath(home)`。
+**一行一阶段**（单行 JSON，`atMs` 单调），可 `tail` / `grep`。
+
+**行 schema**（`src/trace.ts:TraceEntry`；固定键序 `serializeTraceEntry` 锁住）：
+
+| 字段 | 类型 | 出现阶段 | 含义 |
+|------|------|---------|------|
+| `atMs` | number | 全部 | 写入时刻（ms epoch） |
+| `phase` | `'begin' \| 'end'` | 全部 | **阶段枚举**：一次调用恒为 `begin` → `end` 两行 |
+| `action` | string | 全部 | 动作 = 工具名（`blue_event_log_query` …） |
+| `build` | string | 全部 | `<package.version>@<lib/index.js mtime ms>`（Q1：线上跑的是哪个构建） |
+| `pid` | number | 全部 | 进程 pid |
+| `target` | string? | 全部 | 调查对象（`host` → `path` → `value` → `domain` → `query` → `log` 首个非空；截断 120） |
+| `query` | string? | `begin` | **查询摘要**（脱敏参数摘要：`log`/`ids`/`days`/`limit`/`ports` 保留；凭据类只记 `<N chars>`） |
+| `durationMs` | number | 全部 | `begin`=0；`end`=全程实耗（Q5） |
+| `ok` | boolean? | `end` | 工具返回值里显式的 `ok` |
+| `count` | number? | `end` | **命中条数**（`count` 优先，否则 `results`/`hits`/`events` 数组长度，否则 `open`/`scanned` 数值）——**Q4** |
+| `resultBytes` | number? | `end` | 结果 JSON 字节数（量级，**绝不落正文**） |
+| `break` | string? | `end` | `classifyBreak()` 分类（仅 `ok=false` 时出现） |
+| `error` | string? | `end` | 分类前缀 + **已 `scrub`** 的截断 200 字符文本 |
+
+**诚实声明：本契约没有 `exitCode` 字段**（与 `dsh-cyber-range`/`dsh-sec-tools` 不同）。
+原因：`src/host.ts:runPs()` 把 `execFile` 的错误**折叠成一个字符串**
+（`PowerShell 执行失败: ${err.message}`），数字退出码（`err.code`）在到达工具返回值之前就已丢失；
+要记录它必须改 `runPs`/`safe()` 的返回形状 = **业务行为改动**，本轮（零行为变更）不做。
+轨迹以 `break: 'ps-exit'` 表达「子进程失败」，并把「如何拿到真退出码」登记为 §10 U6。
+
+**分类枚举**（`classifyBreak`，可 grep）：`empty` → `ps-timeout`（超时/被杀/maxBuffer）→
+`ps-spawn`（powershell.exe 起不来）→ `ps-exit`（`PowerShell 执行失败`/`Command failed`）→
+`json`（结果解析失败）→ `not-found`（`NOT_FOUND` 哨兵）→ `bad-args`（必填/无效）→ `other`。
+
+**隐私红线（本插件风险最高的一条）**：蓝队结果**天然含哈希原文**（`hashFile` 的 MD5/SHA1/SHA256）、
+管理员名、默认登录名——因此轨迹**只记量级**（`count` / `resultBytes`），**绝不落结果正文**（§7 A15 钉住）。
+入参侧 `hash`/`hashes`/`password`/`user`/`cookie`/`token`/`secret` 等**只记 `<N chars>`**；
+`path`/`value`/`log`/`ids`/`days`/`limit` 等**调查对象保留**（它们是排障要看的查询摘要，非本机凭据）；
+`error` 落盘前过 `scrub(text, secrets)`——`runPs` 的错误里会带**整条 PowerShell 脚本**，
+而脚本内嵌了 `path`/`logName`，这是真实的泄漏面。
+
+**调用点清单**：
+
+| 调用方 | 调用点（文件:符号） | 时机 |
+|-------|------------------|------|
+| 单一切面 | `src/index.ts:apply` → `reg(tool)`（**8 个工具全部**经它注册，轨迹接线只此一处） | 挂载时注册 |
+| 接线 | `src/index.ts:apply` → `tracedExecute({action, build}, tool.execute)` | 每次调用 |
+| 落盘 | `src/trace.ts:tracedExecute` → `safeTrace` → `appendTraceEntry`（吞错返回 bool） | 每次调用两行 |
+| 读取 | `src/trace.ts:readTraceEntries`（坏行/半行/空行/缺失/目录 → 空数组） | 诊断时 |
+
 ## 5 · 边界与信任
 
 - **能力边界 ≠ 沙箱**：`blue_port_scan` 可对**任意 host** 发起 TCP 连接扫描（无白名单、无速率限制、无授权校验）。**「仅自有/已授权资产」是纪律，不是技术强制**——违反时插件不会拦。同理 `blue_hash_lookup` 可对任意路径取哈希（只读，但会暴露路径存在性）。
@@ -147,6 +197,13 @@ dsh-blue-team · apply(ctx, config)
 | A11 | 外来字符串不得逃逸 PS 字面量（注入防线） | `npm test` → `tests/ps-contract.test.mjs`：`assertEscaped` 对 `queryEventLog`/`hashFile` 断言「未转义形态不存在、转义形态存在」；**尸体已取得**（修复前该断言真实失败，见 §9） | **已实测（2026-09-14）** |
 | A12 | PS 脚本可离线确定性复现（时间注入） | `npm test` → 同一 `nowMs` 两次 `queryEventLog(...)` 逐字节相同；不同 `nowMs` 必须不同 | **已实测（2026-09-14）** |
 | A13 | 限额参数真的进入脚本（防「参数被吞」静默退化） | `npm test` → `auditConnections(7)` 含 `Select-Object -First 7`；`queryEventLog(...,42,...)` 含 `-MaxEvents 42` | **已实测（2026-09-14）** |
+| A14 | 轨迹落盘路径可预测且锚定 `DSH_HOME` | `node -e "import('./lib/trace.js').then(m=>console.log(m.tracePath(m.resolveHome({DSH_HOME:'X'},'/h'))))"` → `X/blue-team-trace.jsonl` | ✅ 2026-09-14 |
+| A15 | **哈希原文/管理员名绝不落盘**（蓝队最大泄漏面） | `tests/trace.test.mjs`「隐私尸体测试（一）」：跑一个返回 MD5+SHA1+SHA256 的结果 → 断言轨迹里搜不到任一哈希，且 `"resultBytes":` 在、`"target"` 在 | ✅ 2026-09-14 |
+| A16 | 敏感键参数与**错误文本里的凭据**绝不落盘 | 同文件「隐私尸体测试（二）」：喂 `hash`/`password`/`username` + 错误文本复述它们 → 搜不到，且 `<N chars>`/`[redacted]` 在 | ✅ 2026-09-14 |
+| A17 | 命中条数投影三来源正确 + 断点分类可 grep | 同文件「summarizeResult：命中条数三来源」「classifyBreak」 | ✅ 2026-09-14 |
+| A18 | 观测不反噬：不可写路径 → `false` 且不抛、返回值/异常传播不变 | 同文件「尸体测试」「观测失败不反噬」「异常原样重抛（同一对象）」 | ✅ 2026-09-14 |
+| A19 | 回归能力扩充后仍绿 | `npm test` → **44 pass / 0 fail**（既有 25 + 轨迹 19） | ✅ 2026-09-14 |
+| A20 | 线上自证（五问一条命令可答） | `tail -3 <DSH_HOME>/blue-team-trace.jsonl` → `action`+`build` / `target`+`query` / `count`+`ok` / `durationMs` 一齐可见 | **待线上验收**（需一次真实工具调用） |
 
 ## 8 · 与实现的关系
 
@@ -160,6 +217,30 @@ dsh-blue-team · apply(ctx, config)
   - README 的 ATT&CK 表格与 8 工具**一致**（已逐项核对，无漂移）。
 
 ## 9 · 实践修订记录
+
+- **2026-09-14 · 自证轨迹层（可维护性 S4，零业务行为变更）**
+  - **缺口**：8 个工具都经 `runPs()` 起 PowerShell 子进程，却只有 `ctx.logger` 的 ready 行
+    （宿主 logger **不落盘**）⇒ 事后无法回答「查了什么、命中几条、断在哪一级、花了多久」。
+    讽刺的是：**蓝队工作本身就是「审计要看证据」**，而它自己不留证据。
+  - **补的语义（新契约）**：新增 `src/trace.ts` + `<DSH_HOME>/blue-team-trace.jsonl`
+    （`begin`/`end`），契约与调用点清单见 §4.4；切面**只有一处**——`src/index.ts:apply` 的 `reg()`。
+  - **语义被补充（诚实声明）**：轨迹**没有 `exitCode` 字段**——`host.ts:runPs()` 把 `execFile` 的
+    错误折叠成字符串，数字退出码在到达工具返回值前已丢失。**不伪造**：以 `break: 'ps-exit'`
+    表达「子进程失败」，并把「要记真退出码需改 `runPs`/`safe()` 返回形状（= 业务行为改动）」登记为 §10 U6。
+  - **语义被补充（本插件的隐私重心与前三个不同）**：蓝队**输出**里天然含哈希原文/管理员名
+    ⇒ 轨迹**只记量级**（`count`/`resultBytes`），**绝不落结果正文**；`runPs` 的错误里会带**整条
+    PowerShell 脚本**（脚本内嵌 `path`/`logName`）⇒ `error` 落盘前过 `scrub()`。两条都有独立尸体测试。
+  - **语义边界（敏感键白名单的取向）**：`path`/`value`/`log`/`ids` 是**调查对象**（目标资产与威胁指标），
+    保留为查询摘要；`hash`/口令/用户名等**凭据类**只记长度。白名单写成前瞻式：未来接收哈希/凭据入参的新工具
+    **无需改观测层**即自动受保护。
+  - **行为变更清单**：**无**。工具签名/schema/render/返回值逐字不变；`tracedExecute` 只做
+    「落两行 + 原样转发」，异常**原样重抛同一个对象**（单测钉住）。
+  - **测试**：新增 `tests/trace.test.mjs`（19 条）。全仓 25 → **44/44**。
+  - **我自己写错的四处预期（按真实语义订正，不是代码错）**：① 轨迹字段是 JSON 形态
+    （`"resultBytes":123`）而非 `k=v` 摘要形态——断言里不能写 `resultBytes=`；
+    ② `target` 同理是 `"target":"…"`；③ `'pw-must-not-land'` 是 **16** 字符（心算成 15）；
+    ④ 结果 `{ok:true, results:[]}` 的 `count` 是 **0**（合法值，不是「未取到」——投影函数必须区分
+    `0` 与 `undefined`，否则「零命中」会被记成「无数据」）。
 
 - **2026-09-14 · PowerShell 注入缺陷（`logName` 未转义，已修 + 加机器守卫）**
   - **症状**：`blue_event_log_query` 的 `logName` 是自由字符串参数，被**原样**插进 PS 单引号字面量
@@ -204,3 +285,11 @@ dsh-blue-team · apply(ctx, config)
   故 `eventIds=''` 或含空项（`'4625,,4711'`）会产出 **0**，脚本即查询 `Id=0`——0 不是合法 Windows 事件 ID，
   表现为「静默空结果」而非报错，与 U2 的静默面同源。倾向：过滤 `n > 0` 并对「全被过滤」显式报错。
   **不阻塞本次交付**（真实语义已由 `tests/logic.test.mjs` 钉住，改动即会红）。需裁决。
+- **U6 轨迹无法记录 PowerShell 的真实退出码（2026-09-14 新增，未决）**：
+  `host.ts:runPs()` 在 `execFile` 回调里只保留 `err.message`（折叠成 `PowerShell 执行失败: …`），
+  把 `err.code`（数字退出码）**丢掉了**；工具层的 `safe()` 又只透出字符串，故观测层无从取得。
+  轨迹以 `break:'ps-exit'` 表达同一信息。倾向：`runPs` 把 `err.code` **附加**到 Error 对象
+  （不改 message ⇒ 对外行为不变），`safe()` 在 `{ok:false,error}` 之外多带一个可选的
+  `exitCode`（需同步 output schema）；**这是业务行为改动**（返回值形状变化），故本轮不做，需裁决。
+- **U7 轨迹无轮转/无上限（2026-09-14 新增，未决）**：`blue-team-trace.jsonl` 长期运行会单文件增长。
+  倾向：本批 4 个插件统一在运维层处理（与 §5.22 既有轨迹同款）。

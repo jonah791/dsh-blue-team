@@ -6,6 +6,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { buildStamp, readPackageVersion, tracedExecute } from './trace.js'
 import { scanPorts } from './net.js'
 import {
   runPs, auditConnections, auditAutoruns, queryEventLog, baselineCheck, hashFile,
@@ -27,7 +30,16 @@ const EVENT_IDS: Record<number, string> = {
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('blue-team')
-  const reg = (tool: any) => ctx.tools.register(defineTool(tool as any))
+  // ── 可维护性 S4：自证轨迹（`<DSH_HOME>/blue-team-trace.jsonl`）────────────────
+  // 单一切面：8 个工具**全部**经 `reg()` 注册，轨迹接线只在这一处落笔（漏一处即新缺陷）。
+  // 只记量级（count/resultBytes）——蓝队结果里天然含哈希原文与管理员名，绝不落正文。
+  const HERE = dirname(fileURLToPath(import.meta.url))
+  const SELF = join(HERE, 'index.js')
+  const BUILD = buildStamp(SELF, readPackageVersion(SELF))
+  const reg = (tool: any) => ctx.tools.register(defineTool({
+    ...tool,
+    execute: tracedExecute({ action: String(tool.name), build: BUILD }, tool.execute as (a: any) => Promise<any>),
+  } as any))
   const safe = async <T>(fn: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: string }> => {
     try { return { ok: true, value: await fn() } }
     catch (e: any) { return { ok: false, error: String(e?.message ?? e) } }
