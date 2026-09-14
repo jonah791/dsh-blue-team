@@ -1,6 +1,7 @@
 /** 主机安全工具：进程/连接审计、自启动审计、事件日志、加固基线——本地 PowerShell 执行 */
 
 import { execFile } from 'node:child_process'
+import { psQuote } from './logic.js'
 
 /** 执行 PowerShell 脚本并返回 stdout（UTF-8）。本机只有 PowerShell 5.1（无 pwsh 7），用 powershell.exe */
 export function runPs(script: string, timeoutMs = 30000): Promise<string> {
@@ -66,15 +67,16 @@ $result | Select-Object -First ${scriptLimit} | ConvertTo-Json -Depth 3 -Compres
 `
 }
 
-/** 事件日志查询：按事件 ID 过滤（经典安全事件） */
-export function queryEventLog(eventIds: number[], days: number, logName: string, limit = 100): string {
-  const since = new Date(Date.now() - days * 86400_000).toISOString()
+/** 事件日志查询：按事件 ID 过滤（经典安全事件）
+ *  `nowMs` 为时间注入点（缺省 `Date.now()`）——使脚本可离线确定性单测。 */
+export function queryEventLog(eventIds: number[], days: number, logName: string, limit = 100, nowMs: number = Date.now()): string {
+  const since = new Date(nowMs - days * 86400_000).toISOString()
   const idList = eventIds.join(',')
   return `
 $ErrorActionPreference='SilentlyContinue'
 $idArr = @(${idList})
 $since = [datetime]'${since}'
-$events = Get-WinEvent -FilterHashtable @{ LogName='${logName}'; Id=$idArr; StartTime=$since } -MaxEvents ${limit}
+$events = Get-WinEvent -FilterHashtable @{ LogName='${psQuote(logName)}'; Id=$idArr; StartTime=$since } -MaxEvents ${limit}
 $out = foreach ($e in $events) {
   $msg = ($e.Message -split "\\r?\\n" | Select-Object -First 2) -join ' '
   [PSCustomObject]@{ Time=$e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); Id=$e.Id; Level=$e.LevelDisplayName; Machine=$e.MachineName; Msg=[string]$msg }
@@ -108,7 +110,7 @@ $checks | ConvertTo-Json -Compress
 export function hashFile(filePath: string): string {
   return `
 $ErrorActionPreference='SilentlyContinue'
-$p = '${filePath.replace(/'/g, "''")}'
+$p = '${psQuote(filePath)}'
 if (-not (Test-Path -LiteralPath $p)) { Write-Output 'NOT_FOUND'; exit }
 $md5 = (Get-FileHash -LiteralPath $p -Algorithm MD5).Hash
 $sha1 = (Get-FileHash -LiteralPath $p -Algorithm SHA1).Hash

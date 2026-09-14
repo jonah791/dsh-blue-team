@@ -6,10 +6,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { scanPorts, parsePorts, DEFAULT_PORTS } from './net.js'
+import { scanPorts } from './net.js'
 import {
   runPs, auditConnections, auditAutoruns, queryEventLog, baselineCheck, hashFile,
 } from './host.js'
+import { resolvePorts, parseEventIds, psJsonRows, psHashOutcome } from './logic.js'
 import { searchCveNvd, queryUrlscan } from './intel.js'
 
 export const name = 'dsh-blue-team'
@@ -59,7 +60,7 @@ export function apply(ctx: Context, config: Config): void {
     },
     async execute(args: any) {
       const host = String(args.host ?? '127.0.0.1')
-      const ports = args.ports ? parsePorts(String(args.ports)) : DEFAULT_PORTS
+      const ports = resolvePorts(args.ports)
       if (!ports.length) return { ok: false, error: '端口规格无效' }
       const r = await safe(() => scanPorts(host, ports, Number(args.timeout ?? 1000)))
       if (!r.ok) return { ok: false, error: r.error }
@@ -118,8 +119,7 @@ export function apply(ctx: Context, config: Config): void {
       if (!p) return { ok: false, error: 'path 必填' }
       const r = await safe(async () => {
         const out = await runPs(hashFile(p))
-        if (out === 'NOT_FOUND') return null
-        return JSON.parse(out)
+        return psHashOutcome(out)
       })
       if (!r.ok) return { ok: false, error: r.error }
       return { ok: true, hash: r.value }
@@ -178,9 +178,7 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args: any) {
       const r = await safe(async () => {
         const out = await runPs(auditConnections(Number(args.limit ?? 200)))
-        if (!out) return []
-        const parsed = JSON.parse(out)
-        return Array.isArray(parsed) ? parsed : [parsed]
+        return psJsonRows(out)
       })
       if (!r.ok) return { ok: false, error: r.error }
       return { ok: true, results: r.value }
@@ -207,9 +205,7 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args: any) {
       const r = await safe(async () => {
         const out = await runPs(auditAutoruns(Number(args.limit ?? 100)))
-        if (!out) return []
-        const parsed = JSON.parse(out)
-        return Array.isArray(parsed) ? parsed : [parsed]
+        return psJsonRows(out)
       })
       if (!r.ok) return { ok: false, error: r.error }
       return { ok: true, results: r.value }
@@ -241,15 +237,13 @@ export function apply(ctx: Context, config: Config): void {
       },
     },
     async execute(args: any) {
-      const ids = String(args.eventIds ?? '4625,4624,4672,4720,7045,1102').split(',').map(Number).filter((n) => !Number.isNaN(n))
+      const ids = parseEventIds(args.eventIds)
       const days = Number(args.days ?? 7)
       const log = String(args.logName ?? 'Security')
       const limit = Number(args.limit ?? 100)
       const r = await safe(async () => {
         const out = await runPs(queryEventLog(ids, days, log, limit))
-        if (!out) return []
-        const parsed = JSON.parse(out)
-        return Array.isArray(parsed) ? parsed : [parsed]
+        return psJsonRows(out)
       })
       if (!r.ok) return { ok: false, error: r.error }
       return { ok: true, eventIds: ids.join(','), days, results: r.value }
@@ -276,9 +270,7 @@ export function apply(ctx: Context, config: Config): void {
     async execute() {
       const r = await safe(async () => {
         const out = await runPs(baselineCheck())
-        if (!out) return []
-        const parsed = JSON.parse(out)
-        return Array.isArray(parsed) ? parsed : [parsed]
+        return psJsonRows(out)
       })
       if (!r.ok) return { ok: false, error: r.error }
       return { ok: true, results: r.value }

@@ -143,6 +143,10 @@ dsh-blue-team · apply(ctx, config)
 | A7 | 当前进程加载最新构建 | lib mtime `2026-08-23 12:17:35` < web PID 7080 启动 `2026-09-14 10:05:47` | 已实测（2026-09-14 读数） |
 | A8 | 挂载行唯一 | `grep -n "dsh-blue-team" cordis.patch.yml` → 1 命中（行 175） | 已实测 |
 | A9 | URLhaus 通道未接线 | `grep -rn "queryUrlhaus" src/` → 命中 `intel.ts` 定义处，`index.ts` **无 import** | 已实测（死代码确认） |
+| A10 | 纯逻辑有离线单测且覆盖失败路径 | `npm test` → `tests/logic.test.mjs` **15 例**全过（`resolvePorts`/`parseEventIds`/`psJsonRows`/`psHashOutcome`/`psQuote`；含非法规格、越界、逆序区间、空值、类型不符、损坏 JSON、`NOT_FOUND` 哨兵） | **已实测（2026-09-14，25/25 pass）** |
+| A11 | 外来字符串不得逃逸 PS 字面量（注入防线） | `npm test` → `tests/ps-contract.test.mjs`：`assertEscaped` 对 `queryEventLog`/`hashFile` 断言「未转义形态不存在、转义形态存在」；**尸体已取得**（修复前该断言真实失败，见 §9） | **已实测（2026-09-14）** |
+| A12 | PS 脚本可离线确定性复现（时间注入） | `npm test` → 同一 `nowMs` 两次 `queryEventLog(...)` 逐字节相同；不同 `nowMs` 必须不同 | **已实测（2026-09-14）** |
+| A13 | 限额参数真的进入脚本（防「参数被吞」静默退化） | `npm test` → `auditConnections(7)` 含 `Select-Object -First 7`；`queryEventLog(...,42,...)` 含 `-MaxEvents 42` | **已实测（2026-09-14）** |
 
 ## 8 · 与实现的关系
 
@@ -152,10 +156,37 @@ dsh-blue-team · apply(ctx, config)
   - **缺口② `queryUrlhaus` 未接线（已实测）**：`src/intel.ts:53` 完整实现了 URLhaus 查证（host/url/hash 三态分流），但 `index.ts:13` 只 import 了 `searchCveNvd, queryUrlscan` → 该函数**从装载到运行都不会被调用**。README §已知边界说明了原因（本网络被反爬：空 200），故属**有意保留的备用通道**，但代码里没有注释标注这一点。
   - **缺口③ PowerShell stderr 被丢弃**：`runPs` 只 resolve stdout，`execFile` 回调的 stderr 未取 → 失败原因只剩 `err.message`。
   - **缺口④ 静默空结果**：`$ErrorActionPreference='SilentlyContinue'` + 无权限时 `Get-WinEvent` 无输出 → 表现为「最近 N 天无匹配事件」（与「无权限」不可区分）。
-  - **无单测**：仓库内无 `tests/`，A2–A6 无自动化证据。
+  - **单测（2026-09-14 补课已补）**：`tests/logic.test.mjs`（15）+ `tests/ps-contract.test.mjs`（10）= **25/25 全过**；`npm test` 一条命令可复跑。A2–A6 仍需**真实主机环境**的线上验收（离线单测不能替代），但纯逻辑与注入防线已机器锁死。
   - README 的 ATT&CK 表格与 8 工具**一致**（已逐项核对，无漂移）。
 
 ## 9 · 实践修订记录
+
+- **2026-09-14 · PowerShell 注入缺陷（`logName` 未转义，已修 + 加机器守卫）**
+  - **症状**：`blue_event_log_query` 的 `logName` 是自由字符串参数，被**原样**插进 PS 单引号字面量
+    （`LogName='${logName}'`）。传 `logName = "x'; <任意命令>; '"` 即可闭合字面量并在**当前 PowerShell 上下文**
+    执行任意命令——而 `$ErrorActionPreference='SilentlyContinue'` 还会把噪声压掉。
+    同文件的 `hashFile` **做了** `'` → `''` 转义，说明作者知道该做，只是漏了一处（**防线只覆盖了一半**）。
+  - **证伪证据（修前）**：`node --test "tests/*.test.mjs"` → `tests/ps-contract.test.mjs` 真实失败：
+    `AssertionError: queryEventLog: 未转义宿主串原样进入 PS 字面量 → 可逃逸执行任意命令`。
+  - **修复**：新增 `src/logic.ts:psQuote()`（单一真源的 PS 单引号转义），`queryEventLog` 的 `logName`
+    与 `hashFile` 的 `filePath` 统一走它。
+  - **语义被补充（新不变量）**：**任何进入 PS 单引号字面量的外来字符串必须先 `psQuote()`**——
+    由 `tests/ps-contract.test.mjs:assertEscaped` 机器守卫，**尸体样本**为修复前的未转义形态。
+  - **教训（回写技能 `dsh-plugin-testability`）**：**同类调用点只护住一处 = 半吊子防线**。
+    引入转义 helper 后必须 grep 全部「外来串 → PS 字面量」的调用点（本次两处：`logName`/`filePath`），
+    并让测试对**每一个**调用点断言——只测一处，另一处会安静地留着。
+
+- **2026-09-14 · 逻辑可测试化（纯函数抽取，零行为变更）**
+  - **语义被确认**：`resolvePorts`/`parseEventIds`/`psJsonRows`/`psHashOutcome` 的语义从 `apply()` 闭包
+    移入 `src/logic.ts`（无 IO、时间注入）——**行为逐条对齐原实现**（含 `spec` 真值判定、
+    `Number('')===0` 不过滤、`JSON.parse(null)===null` 等真实语义，已由测试钉住）。
+  - **语义被补充**：`queryEventLog` 新增第 5 参 `nowMs`（缺省 `Date.now()`）——时间注入点，
+    使脚本构建可离线确定性断言；**默认行为不变**。
+  - **语义被修正（我自己的预期错）**：首版测试断言脚本含 `Id=@(4625,4624)`——实测 id 列表先落
+    `$idArr` 变量、过滤表引用 `Id=$idArr`。**预期写错就改预期并把真实语义写进注释**，不是改代码。
+  - **行为变更清单（本次唯一一处）**：`queryEventLog` 的 `logName` 由「原样内插」改为「转义后内插」——
+    仅影响**含单引号**的输入（此前会语法错误或注入）；正常输入（`Security`/`System`/`Application`）
+    产物逐字节不变，已由 A12 的确定性断言覆盖。
 
 - **2026-09-14 补课：本插件此前无语义文档（可维护性工程）**
   - 语义**被确认**：8 工具 ATT&CK 地图；`safe()` 统一错误收敛（I1）；只读优先（I2）；零 key 情报源（I3）；PowerShell 5.1 兼容（I4）；「不存在」与「失败」严格分离。
@@ -169,3 +200,7 @@ dsh-blue-team · apply(ctx, config)
 - **U2 静默面收口**：PowerShell stderr 丢弃 + `SilentlyContinue` → 「无权限/脚本失败/真的没有」三态同形。倾向：`runPs` 同时收集 stderr，并在 `results` 为空时附 `diagnostics` 字段（§5.22 五问中的「断在哪一段」）。需实现者裁决。
 - **U3 情报源冗余**：urlscan 单点（URLhaus 已废）。是否把 `queryUrlhaus` 接成 fallback（urlscan 失败时试 URLhaus）？倾向**接**——已是死代码，接上即为零成本冗余。需裁决。
 - **U4 `enabled` 与 `dsh-code-search` 的同类缺口统一处置**：两插件各有 `enabled` 字段但门控语义不同（一个不门控注册、一个只门控日志）。倾向统一为「删除字段，停用只走组合 `disabled`」（§5.19 单点所有权）。需裁决。
+- **U5 `parseEventIds('')` 产出 `[0]`（2026-09-14 补课实测登记，未决）**：`Number('')===0` 且 `0` 非 `NaN`，
+  故 `eventIds=''` 或含空项（`'4625,,4711'`）会产出 **0**，脚本即查询 `Id=0`——0 不是合法 Windows 事件 ID，
+  表现为「静默空结果」而非报错，与 U2 的静默面同源。倾向：过滤 `n > 0` 并对「全被过滤」显式报错。
+  **不阻塞本次交付**（真实语义已由 `tests/logic.test.mjs` 钉住，改动即会红）。需裁决。
